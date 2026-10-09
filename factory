@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""Dispatch coding tasks to a local OpenCode worker, one git worktree per task.
+
+The manager (a person or Claude) writes the task, this script runs the worker
+and prints one JSON result to stdout: status, branch, commit, test outcome.
+
+  factory run   <repo> <task-id> --prompt "..." [--test "cmd"] [--allow GLOB]...
+  factory diff  <repo> <task-id> [--stat]
+  factory clean <repo> <task-id> [--delete-branch]
+
+Running `run` again with the same task-id reuses the worktree, so a follow-up
+prompt ("fix X") continues from the worker's previous commit.
+
+The task contract is enforced here, not by the prompt:
+  --allow GLOB       files the worker may change; anything else is out_of_scope.
+                     Keep acceptance tests out of this list so the worker cannot edit them.
+  --test CMD         acceptance test, run after the worker stops.
+  --max-attempts N   refuse further attempts and report status "escalate".
+"""
+import argparse
+import fnmatch
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME = Path(os.environ.get("FACTORY_HOME", Path.home() / ".factory"))
+DEFAULT_MODEL = os.environ.get("FACTORY_MODEL", "anthropic/claude-haiku-5-5")
+
+# A worker that repeats the same tool call this many times in a row is stuck.
+LOOP_LIMIT = 4
+POLL_SECONDS = 2
+
+WORKER_RULES = """
+
+Rules for this task:
+- Work only inside the current directory.
+- Change only what the task asks for; keep existing behavior and style.
+- Do not run git commit, git push, or switch branches.
+- When done, reply with a short summary of what you changed."""
+
+
+def git(cwd, *args, check=True):
+    out = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True)
+    if check and out.returncode != 0:
+        sys.exit(f"git {' '.join(args)} failed: {out.stderr.strip()}")
+    return out.stdout.strip()
+
+
+def paths(repo, task_id):
+    repo = Path(repo).resolve()
+    if not (repo / ".git").exists():
+        sys.exit(f"{repo} is not a git repository root")
+    return repo, HOME / "worktrees" / repo.name / task_id, HOME / "runs" / repo.name / task_id
+
+
+def branch_of(task_id):
+    return f"agent/{task_id}"
+
+
+def ensure_worktree(repo, worktree, task_id, base):
+    if worktree.exists():
+        return False
+    worktree.parent.mkdir(parents=True, exist_ok=True)
+    branch = branch_of(task_id)
+    exists = git(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", check=False)
+    if exists:
+        git(repo, "worktree", "add", str(worktree), branch)
+    else:
+        git(repo, "worktree", "add", "-b", branch, str(worktree), base)
+    return True
+
+
+def run_worker(worktree, prompt, model, timeout, events_path):
+    """Run OpenCode headless. Returns (outcome, last assistant text)."""
+    # --standalone gives the worker a private server inside its own process group. On the
+    # shared background service a timed-out session keeps running after the CLI is killed.
+    cmd = ["opencode", "run", "--standalone", "--auto", "--format", "json", "-m", model,
+           prompt + WORKER_RULES]
+    with open(events_path, "w") as events, open(events_path.with_suffix(".err"), "w") as err:
+        # stdin must be closed: with an open non-tty stdin `opencode run` waits on it forever.
+        # PWD must match cwd: OpenCode resolves its working directory from PWD, and an
+        # inherited value makes the worker edit the caller's directory instead of the worktree.
+        proc = subprocess.Popen(cmd, cwd=worktree, env={**os.environ, "PWD": str(worktree)},
+                                stdin=subprocess.DEVNULL, stdout=events, stderr=err,
+                                start_new_session=True)
+        deadline = time.time() + timeout
+        outcome = None
+        while outcome is None:
+            try:
+                code = proc.wait(timeout=POLL_SECONDS)
+                outcome = "ok" if code == 0 else f"worker_exit_{code}"
+            except subprocess.TimeoutExpired:
+                if time.time() >= deadline:
+                    outcome = "timeout"
+                elif read_events(events_path)[2]:
+                    outcome = "loop"
+        if proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGTERM)
+            proc.wait()
+
+    summary, tool_calls, _, usage = read_events(events_path)
+    return outcome, summary.strip(), tool_calls, usage
+
+
+def read_events(events_path):
+    """Returns (last assistant text, tool call count, stuck in a loop, token usage)."""
+    summary, tool_calls, last_call, repeats, looping = "", 0, None, 0, False
+    usage = {"input": 0, "output": 0, "reasoning": 0, "cache_read": 0, "cache_write": 0, "cost": 0.0}
+    for line in events_path.read_text().splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        part = event.get("part", {})
+        if event.get("type") == "tool_use":
+            tool_calls += 1
+            call = (part.get("tool"), json.dumps(part.get("state", {}).get("input"), sort_keys=True))
+            repeats = repeats + 1 if call == last_call else 1
+            last_call = call
+            looping = looping or repeats >= LOOP_LIMIT
+        elif event.get("type") == "text":
+            summary = part.get("text", summary)
+        elif event.get("type") == "step_finish":
+            # A paid worker bills per step; a local model reports cost 0.
+            tokens, cache = part.get("tokens", {}), part.get("tokens", {}).get("cache", {})
+            usage["input"] += tokens.get("input", 0)
+            usage["output"] += tokens.get("output", 0)
+            usage["reasoning"] += tokens.get("reasoning", 0)
+            usage["cache_read"] += cache.get("read", 0)
+            usage["cache_write"] += cache.get("write", 0)
+            usage["cost"] += part.get("cost") or 0
+    usage["cost"] = round(usage["cost"], 6)
+    return summary, tool_calls, looping, usage
+
+
+def cmd_run(args):
+    repo, worktree, run_dir = paths(args.repo, args.task_id)
+    prompt = Path(args.prompt_file).read_text() if args.prompt_file else args.prompt
+    if not prompt or not prompt.strip():
+        sys.exit("empty prompt: pass --prompt or --prompt-file")
+
+    ensure_worktree(repo, worktree, args.task_id, args.base)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    attempt = len(list(run_dir.glob("attempt-*.jsonl"))) + 1
+    if attempt > args.max_attempts:
+        print(json.dumps({"task_id": args.task_id, "status": "escalate", "attempts_used": attempt - 1,
+                          "max_attempts": args.max_attempts, "branch": branch_of(args.task_id),
+                          "log_dir": str(run_dir)}, indent=2))
+        return 2
+    events_path = run_dir / f"attempt-{attempt}.jsonl"
+    (run_dir / f"attempt-{attempt}.prompt.txt").write_text(prompt)
+
+    started = time.time()
+    outcome, summary, tool_calls, usage = run_worker(worktree, prompt, args.model, args.timeout, events_path)
+
+    tests = None
+    if args.test:
+        test_run = subprocess.run(args.test, shell=True, cwd=worktree, capture_output=True, text=True)
+        (run_dir / f"attempt-{attempt}.test.log").write_text(test_run.stdout + test_run.stderr)
+        tests = {"command": args.test, "passed": test_run.returncode == 0,
+                 "tail": (test_run.stdout + test_run.stderr).strip().splitlines()[-8:]}
+
+    commit, files = None, []
+    if git(worktree, "status", "--porcelain"):
+        git(worktree, "add", "-A")
+        git(worktree, "-c", "user.name=factory-worker", "-c", "user.email=factory-worker@localhost",
+            "commit", "-q", "-m", f"feat: {args.task_id} attempt {attempt}")
+        commit = git(worktree, "rev-parse", "--short", "HEAD")
+    branch = branch_of(args.task_id)
+    files = git(repo, "diff", "--name-only", f"{args.base}...{branch}").splitlines()
+
+    out_of_scope = [f for f in files if args.allow and not any(fnmatch.fnmatch(f, g) for g in args.allow)]
+
+    # A worker stopped for looping may already be done, so the gates below decide.
+    if outcome not in ("ok", "loop"):
+        status = outcome
+    elif not files:
+        status = "no_changes"
+    elif out_of_scope:
+        status = "out_of_scope"
+    elif tests and not tests["passed"]:
+        status = "tests_failed"
+    else:
+        status = "completed"
+
+    print(json.dumps({
+        "task_id": args.task_id, "status": status, "attempt": attempt,
+        "worker_exit": outcome, "model": args.model, "branch": branch, "base": args.base, "commit": commit,
+        "files_changed": files, "out_of_scope": out_of_scope,
+        "tests": tests, "tool_calls": tool_calls, "usage": usage,
+        "elapsed_s": round(time.time() - started),
+        "worker_summary": summary[-1200:], "worktree": str(worktree), "log": str(events_path),
+    }, indent=2, ensure_ascii=False))
+    return 0 if status == "completed" else 1
+
+
+def cmd_diff(args):
+    repo, _, _ = paths(args.repo, args.task_id)
+    spec = f"{args.base}...{branch_of(args.task_id)}"
+    return subprocess.run(["git", "-C", str(repo), "--no-pager", "diff", *(["--stat"] if args.stat else []), spec]).returncode
+
+
+def cmd_clean(args):
+    repo, worktree, _ = paths(args.repo, args.task_id)
+    if worktree.exists():
+        git(repo, "worktree", "remove", "--force", str(worktree))
+    if args.delete_branch:
+        git(repo, "branch", "-D", branch_of(args.task_id), check=False)
+    print(json.dumps({"task_id": args.task_id, "cleaned": True, "branch_deleted": args.delete_branch}))
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    run = sub.add_parser("run", help="run a worker on a task and print the JSON result")
+    run.add_argument("repo")
+    run.add_argument("task_id")
+    run.add_argument("--prompt")
+    run.add_argument("--prompt-file")
+    run.add_argument("--test", help="shell command run in the worktree after the worker finishes")
+    run.add_argument("--allow", action="append", default=[], metavar="GLOB",
+                     help="file the worker may change (repeatable); default is any file")
+    run.add_argument("--max-attempts", type=int, default=3)
+    run.add_argument("--base", default="main")
+    run.add_argument("--model", default=DEFAULT_MODEL)
+    run.add_argument("--timeout", type=int, default=300, help="seconds before the worker is stopped")
+    run.set_defaults(func=cmd_run)
+
+    diff = sub.add_parser("diff", help="show the task branch diff against its base")
+    diff.add_argument("repo")
+    diff.add_argument("task_id")
+    diff.add_argument("--base", default="main")
+    diff.add_argument("--stat", action="store_true")
+    diff.set_defaults(func=cmd_diff)
+
+    clean = sub.add_parser("clean", help="remove the task worktree")
+    clean.add_argument("repo")
+    clean.add_argument("task_id")
+    clean.add_argument("--delete-branch", action="store_true")
+    clean.set_defaults(func=cmd_clean)
+
+    args = parser.parse_args()
+    sys.exit(args.func(args))
+
+
+if __name__ == "__main__":
+    main()

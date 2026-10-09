@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Re-run the sandbox epic with one worker model, merging each task that passes its gate.
+#
+#   ./rerun-arm haiku  anthropic/claude-haiku-5-5
+#   ./rerun-arm gemini google/gemini-3.8-flash
+#
+# Every task starts from the arm's own integration branch, so a3 sees a2 merged.
+# Acceptance tests live in tests/acc_*.py and are deliberately left out of --allow:
+# a worker that edits one is reported as out_of_scope.
+set -u
+
+ARM=$1
+MODEL=$2
+REPO="$HOME/Git/labs/@codefactory/sandbox"
+F="$HOME/Git/labs/@codefactory/factory"
+OUT="$HOME/.factory/runs/sandbox/arm-$ARM.jsonl"
+
+mkdir -p "$(dirname "$OUT")"
+: > "$OUT"
+git -C "$REPO" checkout -q -B "arm-$ARM" rerun-base
+
+run_task() {
+  local task=$1 allow=$2 test=$3 prompt=$4
+  local id="$ARM-$task"
+  local json="/tmp/factory-$id.json"
+
+  "$F" run "$REPO" "$id" --base "arm-$ARM" --model "$MODEL" \
+      --allow "$allow" --test "$test" --max-attempts 3 --prompt "$prompt" > "$json" 2>/tmp/factory-$id.stderr
+
+  python3 - "$json" "$OUT" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1]))
+open(sys.argv[2], "a").write(json.dumps(r) + "\n")
+u = r.get("usage", {})
+print(f"  {r['task_id']:<22} {r['status']:<13} {r['elapsed_s']:>4}s  "
+      f"tools={r['tool_calls']:>3}  cost=${u.get('cost', 0):.4f}  "
+      f"files={','.join(r['files_changed']) or '-'}")
+if r["out_of_scope"]:
+    print(f"    out_of_scope: {r['out_of_scope']}")
+PY
+
+  if [ "$(python3 -c "import json;print(json.load(open('$json'))['status'])")" = "completed" ]; then
+    git -C "$REPO" merge -q --no-ff -m "merge: $id" "agent/$id" && echo "    merged into arm-$ARM"
+  fi
+}
+
+echo "arm=$ARM model=$MODEL"
+
+run_task a1-slugify "kit/text.py" "python3 -m unittest -q tests.acc_slugify" \
+"Add a function slugify(text: str) -> str to kit/text.py. It lowercases the text, replaces every run of characters that are not ASCII letters or digits with a single hyphen, and strips leading and trailing hyphens. Example: slugify('  Hello, World!  ') == 'hello-world'. An input with no letters or digits returns ''. The acceptance tests already exist in tests/acc_slugify.py: read them, do not modify them, and do not add or change any other file. Verify with 'python3 -m unittest -q tests.acc_slugify' from the repository root."
+
+run_task a2-parse-duration "kit/durations.py" "python3 -m unittest -q tests.acc_parse_duration" \
+"Create a new module kit/durations.py with a function parse_duration(text: str) -> int that converts strings like '1h30m', '45s', '2h', '1h2m3s' into a total number of seconds. Units are h, m, s; each unit appears at most once and they must appear in the order h, m, s. Raise ValueError for an empty string, an unknown unit, a wrong order, or anything else that does not match. The acceptance tests already exist in tests/acc_parse_duration.py: read them, do not modify them, and do not add or change any other file. Verify with 'python3 -m unittest -q tests.acc_parse_duration' from the repository root."
+
+run_task a3-format-duration "kit/durations.py" "python3 -m unittest -q tests.acc_format_duration" \
+"In kit/durations.py add a function format_duration(seconds: int) -> str that is the inverse of the existing parse_duration: 5400 -> '1h30m', 45 -> '45s', 7200 -> '2h', 3723 -> '1h2m3s'. Units with a zero value are omitted. 0 returns '0s'. A negative value raises ValueError. Do not change parse_duration. The acceptance tests already exist in tests/acc_format_duration.py: read them, do not modify them, and do not add or change any other file. Verify with 'python3 -m unittest -q tests.acc_format_duration' from the repository root."
+
+run_task a4-title-case "kit/text.py" "python3 -m unittest -q tests.acc_title_case" \
+"Add a function title_case(text: str) -> str to kit/text.py. It splits the text on whitespace, capitalizes the first letter of each word, lowercases the rest of each word, and joins the words with a single space. The acceptance tests already exist in tests/acc_title_case.py: read them, do not modify them, and do not add or change any other file. Verify with 'python3 -m unittest -q tests.acc_title_case' from the repository root."
+
+echo "integration check on arm-$ARM"
+for t in acc_slugify acc_parse_duration acc_format_duration acc_title_case; do
+  printf "  %-22s " "$t"
+  (cd "$REPO" && python3 -m unittest -q "tests.$t" >/dev/null 2>&1) && echo pass || echo FAIL
+done

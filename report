@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+"""Summarise arm runs recorded by `rerun-arm` into one comparison table.
+
+    ./report [arm ...]        # default: every arm-*.jsonl in the run directory
+
+Each line of ~/.factory/runs/<repo>/arm-<name>.jsonl is one `factory run` result.
+Worker cost comes from the `usage` block, so a local model shows 0.
+"""
+import json
+import os
+import sys
+from pathlib import Path
+
+RUNS = Path(os.environ.get("FACTORY_HOME", Path.home() / ".factory")) / "runs" / "sandbox"
+
+
+def load(arm):
+    path = RUNS / f"arm-{arm}.jsonl"
+    if not path.exists():
+        sys.exit(f"no results for arm {arm}: {path} missing")
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+def main():
+    arms = sys.argv[1:] or sorted(p.stem[4:] for p in RUNS.glob("arm-*.jsonl"))
+    if not arms:
+        sys.exit("no arm-*.jsonl found; run ./rerun-arm first")
+
+    totals = {}
+    for arm in arms:
+        results = load(arm)
+        print(f"\narm {arm}  ({results[0].get('model', '?')})")
+        print(f"  {'task':<22} {'status':<13} {'try':>3} {'secs':>5} {'tools':>5} "
+              f"{'in+cache':>9} {'out':>6} {'cost $':>8}")
+        agg = {"secs": 0, "tools": 0, "tok_in": 0, "tok_out": 0, "cost": 0.0,
+               "first_try": 0, "done": 0, "n": len(results), "scope": 0}
+        for r in results:
+            u = r.get("usage", {})
+            tok_in = u.get("input", 0) + u.get("cache_read", 0) + u.get("cache_write", 0)
+            print(f"  {r['task_id']:<22} {r['status']:<13} {r['attempt']:>3} "
+                  f"{r['elapsed_s']:>5} {r['tool_calls']:>5} {tok_in:>9} "
+                  f"{u.get('output', 0):>6} {u.get('cost', 0):>8.4f}")
+            agg["secs"] += r["elapsed_s"]
+            agg["tools"] += r["tool_calls"]
+            agg["tok_in"] += tok_in
+            agg["tok_out"] += u.get("output", 0)
+            agg["cost"] += u.get("cost", 0)
+            agg["done"] += r["status"] == "completed"
+            agg["first_try"] += r["status"] == "completed" and r["attempt"] == 1
+            agg["scope"] += bool(r["out_of_scope"])
+        print(f"  {'TOTAL':<22} {'':<13} {'':>3} {agg['secs']:>5} {agg['tools']:>5} "
+              f"{agg['tok_in']:>9} {agg['tok_out']:>6} {agg['cost']:>8.4f}")
+        totals[arm] = agg
+
+    print(f"\n{'arm':<10} {'pass':>6} {'1st try':>8} {'scope viol':>11} "
+          f"{'wall s':>7} {'worker $':>9} {'$ / merged task':>16}")
+    for arm, a in totals.items():
+        per = a["cost"] / a["done"] if a["done"] else 0
+        print(f"{arm:<10} {a['done']}/{a['n']:<4} {a['first_try']}/{a['n']:<6} "
+              f"{a['scope']:>11} {a['secs']:>7} {a['cost']:>9.4f} {per:>16.4f}")
+    print("\nLeader tokens are not in here: read them from the Claude session that drove the run.")
+
+
+if __name__ == "__main__":
+    main()
